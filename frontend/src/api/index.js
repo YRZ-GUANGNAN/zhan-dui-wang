@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { API_BASE } from '../config.js'
+import { disconnect } from './websocket.js'
 
 const api = axios.create({
   baseURL: API_BASE
@@ -16,6 +17,7 @@ api.interceptors.response.use(
   error => {
     const isAuthRequest = error.config?.url?.startsWith('/auth/')
     if (error.response?.status === 401 && !isAuthRequest) {
+      disconnect()
       localStorage.clear()
       window.location.assign('/login')
     }
@@ -26,7 +28,11 @@ api.interceptors.response.use(
 export default {
   auth: {
     login(data) { return api.post('/auth/login', data) },
-    register(data) { return api.post('/auth/register', data) }
+    register(data) { return api.post('/auth/register', data) },
+    logout() {
+      disconnect()
+      localStorage.clear()
+    }
   },
   users: {
     list(excludeId) { return api.get('/users/list', { params: { excludeId } }) },
@@ -55,13 +61,14 @@ export default {
     requests(userId) { return api.get(`/friends/requests/${userId}`) }
   },
   messages: {
-    send(senderId, receiverId, content) {
-      return api.post('/messages', { content }, { params: { senderId, receiverId } })
+    send(senderId, receiverId, content, clientId) {
+      return api.post('/messages', { content, clientId }, { params: { senderId, receiverId } })
     },
-    sendImage(senderId, receiverId, file) {
+    sendImage(senderId, receiverId, file, clientId) {
       const formData = new FormData()
       formData.append('senderId', senderId)
       formData.append('receiverId', receiverId)
+      formData.append('clientId', clientId)
       formData.append('file', file)
       return api.post('/messages/image', formData)
     },

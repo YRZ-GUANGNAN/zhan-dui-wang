@@ -62,7 +62,7 @@ export default {
         this.requests = this.requests.filter(r => r.id !== id)
       } catch (e) { alert(e.response?.data?.error || '操作失败') }
     },
-    logout() { localStorage.clear(); this.$router.push('/login') }
+    logout() { api.auth.logout(); this.$router.push('/login') }
   }
 }
 </script>

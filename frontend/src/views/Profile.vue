@@ -209,7 +209,7 @@ export default {
       document.body.appendChild(t)
       setTimeout(() => t.remove(), 2000)
     },
-    logout() { localStorage.clear(); this.$router.push('/login') },
+    logout() { api.auth.logout(); this.$router.push('/login') },
     async toggleShowOnPlanet() {
       const newVal = !(this.user.showOnPlanet !== false)
       try {

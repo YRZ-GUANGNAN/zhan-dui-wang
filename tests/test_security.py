@@ -4,7 +4,7 @@ import os
 
 import jwt
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, UploadFile, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("DB_USER", "test")
@@ -146,3 +146,64 @@ def test_non_image_upload_is_rejected():
     with pytest.raises(HTTPException) as exc:
         asyncio.run(api_service.save_image(upload, "avatars"))
     assert exc.value.status_code == 415
+
+
+def test_websocket_rejects_invalid_token():
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({"type": "auth", "token": "invalid"})
+            websocket.receive_json()
+    assert exc.value.code == 4401
+
+
+def test_websocket_delivers_ack(monkeypatch):
+    def fake_persist(sender_id, receiver_id, content, client_id, image_url=None):
+        assert image_url is None
+        return {
+            "id": 99,
+            "clientId": client_id,
+            "content": content,
+            "imageUrl": None,
+            "createTime": "2026-06-28 22:00:00",
+            "sender": {"id": sender_id},
+            "receiver": {"id": receiver_id},
+        }
+
+    monkeypatch.setattr(api_service, "persist_message", fake_persist)
+    with client.websocket_connect("/ws") as sender:
+        sender.send_json({"type": "auth", "token": token(1)})
+        assert sender.receive_json() == {"type": "ready", "userId": 1}
+
+        sender.send_json({
+            "type": "message",
+            "receiverId": 2,
+            "content": "hello",
+            "clientId": "client-message-1",
+        })
+        ack = sender.receive_json()
+
+        assert ack["type"] == "ack"
+        assert ack["clientId"] == "client-message-1"
+        assert ack["message"]["id"] == 99
+
+
+def test_connection_manager_routes_messages():
+    class FakeSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, payload):
+            self.messages.append(payload)
+
+    async def exercise():
+        manager = api_service.ChatConnectionManager()
+        socket = FakeSocket()
+        assert await manager.connect(2, socket) is True
+        await manager.send_to_user(2, {"type": "message", "message": {"id": 99}})
+        manager.disconnect(2, socket)
+        assert socket.messages == [
+            {"type": "message", "message": {"id": 99}}
+        ]
+        assert 2 not in manager.connections
+
+    asyncio.run(exercise())

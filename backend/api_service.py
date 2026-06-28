@@ -1,10 +1,12 @@
 ﻿"""湛对网 统一API服务 (替代Java后端)"""
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi import UploadFile, File, Form
+from starlette.concurrency import run_in_threadpool
+from pymysql.err import IntegrityError
 from pymysql.cursors import DictCursor
 import bcrypt, jwt as pyjwt, datetime as dt, secrets, json, uvicorn, random
-import os
+import asyncio, os
 
 try:
     from .database import DatabasePool
@@ -60,6 +62,11 @@ PUBLIC_API_PATHS = {
 }
 
 
+def decode_user_token(token: str) -> int:
+    payload = pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    return int(payload["userId"])
+
+
 @app.middleware("http")
 async def authenticate_api_request(request: Request, call_next):
     path = request.url.path
@@ -68,8 +75,7 @@ async def authenticate_api_request(request: Request, call_next):
         if not authorization.startswith("Bearer "):
             return JSONResponse({"detail": "Authentication required"}, status_code=401)
         try:
-            payload = pyjwt.decode(authorization[7:], JWT_SECRET, algorithms=["HS256"])
-            request.state.user_id = int(payload["userId"])
+            request.state.user_id = decode_user_token(authorization[7:])
         except (pyjwt.PyJWTError, KeyError, TypeError, ValueError):
             return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
 
@@ -122,6 +128,257 @@ async def save_image(file: UploadFile, category: str) -> str:
     with open(path, "xb") as output:
         output.write(data)
     return f"/uploads/{category}/{filename}"
+
+
+class ChatConnectionManager:
+    def __init__(self):
+        self.connections = collections.defaultdict(set)
+        self.max_connections_per_user = int(
+            os.environ.get("WS_MAX_CONNECTIONS_PER_USER", "5")
+        )
+
+    async def connect(self, user_id: int, websocket: WebSocket) -> bool:
+        sockets = self.connections[user_id]
+        if len(sockets) >= self.max_connections_per_user:
+            await websocket.close(code=4429, reason="Too many connections")
+            return False
+        sockets.add(websocket)
+        return True
+
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        sockets = self.connections.get(user_id)
+        if not sockets:
+            return
+        sockets.discard(websocket)
+        if not sockets:
+            self.connections.pop(user_id, None)
+
+    async def send_to_user(self, user_id: int, payload: dict, exclude=None):
+        dead = []
+        for websocket in list(self.connections.get(user_id, ())):
+            if websocket is exclude:
+                continue
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                dead.append(websocket)
+        for websocket in dead:
+            self.disconnect(user_id, websocket)
+
+
+chat_connections = ChatConnectionManager()
+
+
+def normalize_message(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "clientId": row.get("client_id"),
+        "content": row.get("content") or "",
+        "imageUrl": row.get("image_url"),
+        "createTime": str(row.get("create_time") or ""),
+        "sender": {"id": row["sender_id"]},
+        "receiver": {"id": row["receiver_id"]},
+    }
+
+
+def find_message_by_client_id(sender_id: int, client_id: str):
+    c = db().cursor(DictCursor)
+    c.execute(
+        """
+        SELECT id,client_id,content,image_url,create_time,sender_id,receiver_id
+        FROM messages
+        WHERE sender_id=%s AND client_id=%s
+        LIMIT 1
+        """,
+        (sender_id, client_id),
+    )
+    row = c.fetchone()
+    c.connection.close()
+    return normalize_message(row) if row else None
+
+
+def persist_message(
+    sender_id: int,
+    receiver_id: int,
+    content: str,
+    client_id: str | None = None,
+    image_url: str | None = None,
+):
+    c = db().cursor()
+    try:
+        c.execute(
+            """
+            INSERT INTO messages
+                (sender_id,receiver_id,content,image_url,client_id,create_time)
+            VALUES (%s,%s,%s,%s,%s,NOW())
+            """,
+            (sender_id, receiver_id, content, image_url, client_id),
+        )
+        c.connection.commit()
+        message_id = c.lastrowid
+    except IntegrityError:
+        c.connection.rollback()
+        c.connection.close()
+        if client_id:
+            existing = find_message_by_client_id(sender_id, client_id)
+            if existing:
+                return existing
+        raise
+    c.connection.close()
+
+    c = db().cursor(DictCursor)
+    c.execute(
+        """
+        SELECT id,client_id,content,image_url,create_time,sender_id,receiver_id
+        FROM messages WHERE id=%s
+        """,
+        (message_id,),
+    )
+    row = c.fetchone()
+    c.connection.close()
+    return normalize_message(row)
+
+
+def persist_read_receipt(user_id: int, message_id: int):
+    c = db().cursor(DictCursor)
+    c.execute(
+        "SELECT sender_id FROM messages WHERE id=%s AND receiver_id=%s",
+        (message_id, user_id),
+    )
+    row = c.fetchone()
+    if not row:
+        c.connection.close()
+        return None
+    c.execute(
+        "UPDATE messages SET is_read=1 WHERE id=%s AND receiver_id=%s",
+        (message_id, user_id),
+    )
+    c.connection.commit()
+    c.connection.close()
+    return row["sender_id"]
+
+
+def valid_client_id(value) -> str | None:
+    if value is None:
+        return None
+    client_id = str(value).strip()
+    if not client_id or len(client_id) > 64:
+        raise ValueError("Invalid clientId")
+    return client_id
+
+
+@app.websocket("/ws")
+async def chat_websocket(websocket: WebSocket):
+    await websocket.accept()
+    user_id = None
+    message_times = collections.deque()
+    try:
+        auth = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+        if auth.get("type") != "auth":
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+        try:
+            user_id = decode_user_token(str(auth.get("token", "")))
+        except (pyjwt.PyJWTError, KeyError, TypeError, ValueError):
+            await websocket.close(code=4401, reason="Invalid token")
+            return
+        if not await chat_connections.connect(user_id, websocket):
+            return
+        await websocket.send_json({"type": "ready", "userId": user_id})
+
+        while True:
+            data = await websocket.receive_json()
+            message_type = data.get("type")
+            if message_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            now = time_mod.time()
+            while message_times and now - message_times[0] >= 60:
+                message_times.popleft()
+            if len(message_times) >= 60:
+                await websocket.send_json(
+                    {"type": "error", "code": "rate_limited"}
+                )
+                continue
+            message_times.append(now)
+
+            if message_type == "message":
+                try:
+                    receiver_id = int(data.get("receiverId", 0))
+                    client_id = valid_client_id(data.get("clientId"))
+                except (TypeError, ValueError):
+                    await websocket.send_json(
+                        {"type": "error", "code": "invalid_message"}
+                    )
+                    continue
+                content = str(data.get("content", "")).strip()
+                if (
+                    not receiver_id
+                    or receiver_id == user_id
+                    or not content
+                    or len(content) > 2000
+                ):
+                    await websocket.send_json(
+                        {"type": "error", "code": "invalid_message"}
+                    )
+                    continue
+                message = await run_in_threadpool(
+                    persist_message,
+                    user_id,
+                    receiver_id,
+                    content,
+                    client_id,
+                )
+                await websocket.send_json(
+                    {
+                        "type": "ack",
+                        "clientId": client_id,
+                        "message": message,
+                    }
+                )
+                await chat_connections.send_to_user(
+                    receiver_id,
+                    {"type": "message", "message": message},
+                )
+                await chat_connections.send_to_user(
+                    user_id,
+                    {"type": "sent", "message": message},
+                    exclude=websocket,
+                )
+            elif message_type == "read":
+                try:
+                    message_id = int(data.get("messageId", 0))
+                except (TypeError, ValueError):
+                    continue
+                sender_id = await run_in_threadpool(
+                    persist_read_receipt,
+                    user_id,
+                    message_id,
+                )
+                if sender_id:
+                    await chat_connections.send_to_user(
+                        sender_id,
+                        {
+                            "type": "read",
+                            "messageId": message_id,
+                            "readerId": user_id,
+                        },
+                    )
+            else:
+                await websocket.send_json(
+                    {"type": "error", "code": "unknown_type"}
+                )
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    except Exception:
+        try:
+            await websocket.close(code=1011, reason="Internal error")
+        except Exception:
+            pass
+    finally:
+        if user_id is not None:
+            chat_connections.disconnect(user_id, websocket)
 def ok(data): return data
 
 # ===== AUTH =====
@@ -342,33 +599,44 @@ async def delete_conversation(request: Request, userId: int = 0, otherUserId: in
 async def conversation(request: Request, userId: int = 0, otherUserId: int = 0):
     user_id = require_self(request, userId)
     c = db().cursor(DictCursor)
-    c.execute("SELECT m.id, m.content, m.image_url as imageUrl, m.create_time as createTime, m.sender_id, m.receiver_id FROM messages m WHERE (m.sender_id=%s AND m.receiver_id=%s) OR (m.sender_id=%s AND m.receiver_id=%s) ORDER BY m.create_time LIMIT 100",(user_id,otherUserId,otherUserId,user_id))
+    c.execute("SELECT m.id,m.client_id,m.content,m.image_url,m.create_time,m.sender_id,m.receiver_id FROM messages m WHERE (m.sender_id=%s AND m.receiver_id=%s) OR (m.sender_id=%s AND m.receiver_id=%s) ORDER BY m.create_time LIMIT 100",(user_id,otherUserId,otherUserId,user_id))
     msgs = c.fetchall()
     c.connection.close()
-    result = []
-    for m in msgs:
-        result.append({
-            "id": m['id'], "content": m['content'], "imageUrl": m['imageUrl'],
-            "createTime": str(m['createTime']), "sender": {"id": m['sender_id']}, "receiver": {"id": m['receiver_id']}
-        })
-    return result
+    return [normalize_message(message) for message in msgs]
 
 @app.post("/api/messages")
 async def send_message(req: Request):
     data = await req.json()
     sid = req.state.user_id
-    rid = int(req.query_params.get("receiverId", data.get("receiverId",0)))
-    content = data.get("content","")
+    try:
+        rid = int(req.query_params.get("receiverId", data.get("receiverId",0)))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "无效的接收者")
+    content = data.get("content","").strip()
+    try:
+        client_id = valid_client_id(data.get("clientId"))
+    except ValueError:
+        raise HTTPException(400, "无效的 clientId")
     if not rid or rid == sid:
         raise HTTPException(400, "无效的接收者")
-    if not content.strip() or len(content) > 2000:
+    if not content or len(content) > 2000:
         raise HTTPException(400, "消息内容长度无效")
-    c = db().cursor()
-    c.execute("INSERT INTO messages (sender_id, receiver_id, content, create_time) VALUES (%s,%s,%s,NOW())",(sid,rid,content))
-    c.connection.commit()
-    mid = c.lastrowid
-    c.connection.close()
-    return {"id":mid,"content":content,"sender":{"id":sid},"receiver":{"id":rid}}
+    message = await run_in_threadpool(
+        persist_message,
+        sid,
+        rid,
+        content,
+        client_id,
+    )
+    await chat_connections.send_to_user(
+        rid,
+        {"type": "message", "message": message},
+    )
+    await chat_connections.send_to_user(
+        sid,
+        {"type": "sent", "message": message},
+    )
+    return message
 
 
 @app.post("/api/messages/image")
@@ -384,22 +652,28 @@ async def send_image(req: Request):
     file = form.get("file")
     if not file or not hasattr(file, "read"):
         raise HTTPException(400, "请选择图片")
+    try:
+        client_id = valid_client_id(form.get("clientId"))
+    except ValueError:
+        raise HTTPException(400, "无效的 clientId")
     image_url = await save_image(file, "messages")
-    c = db().cursor()
-    c.execute(
-        "INSERT INTO messages (sender_id, receiver_id, content, image_url, create_time) VALUES (%s,%s,%s,%s,NOW())",
-        (sid, rid, "[图片]", image_url),
+    message = await run_in_threadpool(
+        persist_message,
+        sid,
+        rid,
+        "[图片]",
+        client_id,
+        image_url,
     )
-    c.connection.commit()
-    mid = c.lastrowid
-    c.connection.close()
-    return {
-        "id": mid,
-        "content": "[图片]",
-        "imageUrl": image_url,
-        "sender": {"id": sid},
-        "receiver": {"id": rid},
-    }
+    await chat_connections.send_to_user(
+        rid,
+        {"type": "message", "message": message},
+    )
+    await chat_connections.send_to_user(
+        sid,
+        {"type": "sent", "message": message},
+    )
+    return message
 
 
 @app.get("/api/messages/unread/{uid}")
@@ -414,10 +688,16 @@ async def unread(uid: int, request: Request):
 @app.put("/api/messages/read/{mid}")
 async def mark_read(mid: int, request: Request, userId: int = 0):
     user_id = require_self(request, userId)
-    c = db().cursor()
-    c.execute("UPDATE messages SET is_read=1 WHERE id=%s AND receiver_id=%s",(mid,user_id))
-    c.connection.commit()
-    c.connection.close()
+    sender_id = await run_in_threadpool(
+        persist_read_receipt,
+        user_id,
+        mid,
+    )
+    if sender_id:
+        await chat_connections.send_to_user(
+            sender_id,
+            {"type": "read", "messageId": mid, "readerId": user_id},
+        )
     return {"ok":True}
 
 # ===== POSTS (忆涟) =====
@@ -877,4 +1157,7 @@ if __name__ == "__main__":
         app,
         host=os.environ.get("APP_HOST", "127.0.0.1"),
         port=int(os.environ.get("APP_PORT", "8002")),
+        ws_max_size=65536,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
     )

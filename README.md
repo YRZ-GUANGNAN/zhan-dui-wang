@@ -31,3 +31,15 @@ cd /opt/zhandui/releases/<release>
 
 Always run `/opt/zhandui/backup.sh` and verify the resulting archive before an
 upgrade.
+
+## Realtime chat
+
+The browser opens one authenticated WebSocket at `wss://zhanduiwang.top/ws`.
+The first frame must contain the JWT:
+
+```json
+{"type": "auth", "token": "<jwt>"}
+```
+
+Text messages use a client-generated `clientId`. The database unique constraint
+on `(sender_id, client_id)` makes WebSocket retry and REST fallback idempotent.
