@@ -853,4 +853,8 @@ async function logout(){await fetch('/api/admin/logout');location.reload()}
 """
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8002)
+    uvicorn.run(
+        app,
+        host=os.environ.get("APP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("APP_PORT", "8002")),
+    )
