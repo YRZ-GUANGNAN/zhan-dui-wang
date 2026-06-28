@@ -44,6 +44,32 @@ def test_health_is_public():
     assert response.json() == {"status": "ok"}
 
 
+def test_readiness_checks_database(monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.connection = self
+            self.closed = False
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql):
+            assert sql == "SELECT 1"
+
+        def fetchone(self):
+            return (1,)
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeConnection()
+    monkeypatch.setattr(api_service, "db", lambda: fake)
+    response = client.get("/api/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+    assert fake.closed is True
+
+
 def test_private_api_requires_token():
     response = client.get("/api/conversations", params={"userId": 1})
     assert response.status_code == 401

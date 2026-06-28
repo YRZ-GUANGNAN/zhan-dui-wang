@@ -14,3 +14,20 @@ Set-Location ..
 ```
 
 Production secrets belong in `/etc/zhandui/zhandui.env` and must never be committed.
+
+## Database migrations
+
+Production migrations use a dedicated DDL account from
+`/etc/zhandui/migration.env`.
+
+```bash
+set -a
+. /etc/zhandui/migration.env
+set +a
+cd /opt/zhandui/releases/<release>
+/opt/zhandui/venv/bin/python3 -m alembic -c alembic.ini current
+/opt/zhandui/venv/bin/python3 -m alembic -c alembic.ini upgrade head
+```
+
+Always run `/opt/zhandui/backup.sh` and verify the resulting archive before an
+upgrade.

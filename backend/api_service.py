@@ -2,10 +2,14 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi import UploadFile, File, Form
-from pymysql import connect
 from pymysql.cursors import DictCursor
 import bcrypt, jwt as pyjwt, datetime as dt, secrets, json, uvicorn, random
 import os
+
+try:
+    from .database import DatabasePool
+except ImportError:
+    from database import DatabasePool
 
 app = FastAPI(title="湛对网API")
 
@@ -39,13 +43,18 @@ DB = {
 }
 JWT_SECRET = required_env("JWT_SECRET")
 
-def db(): return connect(**DB)
+database_pool = DatabasePool(DB)
+
+
+def db():
+    return database_pool.connect()
 
 
 PUBLIC_API_PATHS = {
     "/api/auth/login",
     "/api/auth/register",
     "/api/health",
+    "/api/health/ready",
     "/api/public/stats",
     "/api/admin/login",
 }
@@ -251,7 +260,7 @@ async def toggle_planet(uid: int, request: Request, value: bool = True):
 async def my_friends(uid: int, request: Request):
     require_self(request, uid)
     c = db().cursor(DictCursor)
-    c.execute("SELECT f.id as friendship_id, u.id, u.username, u.nickname, u.age, u.gender, u.location, u.avatar FROM friendships f JOIN users u ON u.id = CASE WHEN f.user_id=%s THEN f.friend_id ELSE f.user_id END WHERE (f.user_id=%s OR f.friend_id=%s) ORDER BY f.create_time DESC LIMIT 100", (uid,uid,uid))
+    c.execute("SELECT f.id as friendship_id, u.id, u.username, u.nickname, u.age, u.gender, u.location, u.avatar FROM friendships f JOIN users u ON u.id = CASE WHEN f.user_id=%s THEN f.friend_id ELSE f.user_id END WHERE (f.user_id=%s OR f.friend_id=%s) AND f.status='ACCEPTED' ORDER BY f.create_time DESC LIMIT 100", (uid,uid,uid))
     friends = c.fetchall()
     c.connection.close()
     return friends
@@ -260,7 +269,7 @@ async def my_friends(uid: int, request: Request):
 async def friend_requests(uid: int, request: Request):
     require_self(request, uid)
     c = db().cursor(DictCursor)
-    c.execute("SELECT f.id as friendship_id, u.id, u.username, u.nickname, u.age, u.gender, u.location, u.avatar FROM friendships f JOIN users u ON u.id=f.user_id WHERE f.friend_id=%s",(uid,))
+    c.execute("SELECT f.id as friendship_id, u.id, u.username, u.nickname, u.age, u.gender, u.location, u.avatar FROM friendships f JOIN users u ON u.id=f.user_id WHERE f.friend_id=%s AND f.status='PENDING'",(uid,))
     reqs = c.fetchall()
     c.connection.close()
     return reqs
@@ -271,12 +280,19 @@ async def send_request(fid: int, request: Request, userId: int = 0):
     if fid == user_id:
         raise HTTPException(400, "不能添加自己为好友")
     c = db().cursor()
+    c.execute(
+        "SELECT id,status FROM friendships WHERE (user_id=%s AND friend_id=%s) OR (user_id=%s AND friend_id=%s) LIMIT 1",
+        (user_id, fid, fid, user_id),
+    )
+    if c.fetchone():
+        c.connection.close()
+        raise HTTPException(409, "好友关系或申请已存在")
     try:
         c.execute("INSERT INTO friendships (user_id, friend_id, status, create_time) VALUES (%s,%s,'PENDING',NOW())",(user_id,fid))
         c.connection.commit()
-    except Exception as e:
+    except Exception:
         c.connection.close()
-        raise HTTPException(400, f"请求失败: {e}")
+        raise HTTPException(409, "无法创建好友申请")
     c.connection.close()
     return {"ok":True}
 
@@ -284,7 +300,10 @@ async def send_request(fid: int, request: Request, userId: int = 0):
 async def accept_request(fsid: int, request: Request, userId: int = 0):
     user_id = require_self(request, userId)
     c = db().cursor()
-    c.execute("UPDATE friendships SET status='ACCEPTED' WHERE id=%s AND friend_id=%s",(fsid,user_id))
+    c.execute("UPDATE friendships SET status='ACCEPTED' WHERE id=%s AND friend_id=%s AND status='PENDING'",(fsid,user_id))
+    if c.rowcount != 1:
+        c.connection.close()
+        raise HTTPException(404, "好友申请不存在")
     c.connection.commit()
     c.connection.close()
     return {"ok":True}
@@ -293,7 +312,7 @@ async def accept_request(fsid: int, request: Request, userId: int = 0):
 async def reject_request(fsid: int, request: Request, userId: int = 0):
     user_id = require_self(request, userId)
     c = db().cursor()
-    c.execute("DELETE FROM friendships WHERE id=%s AND friend_id=%s",(fsid,user_id))
+    c.execute("DELETE FROM friendships WHERE id=%s AND friend_id=%s AND status='PENDING'",(fsid,user_id))
     c.connection.commit()
     c.connection.close()
     return {"ok":True}
@@ -470,8 +489,8 @@ async def post_likes(pid: int, request: Request, userId: int = 0):
 async def like_post(pid: int, request: Request, userId: int = 0):
     user_id = require_self(request, userId)
     c = db().cursor()
-    try: c.execute("INSERT IGNORE INTO post_likes (post_id,user_id) VALUES (%s,%s)",(pid,user_id)); c.connection.commit()
-    except: pass
+    c.execute("INSERT IGNORE INTO post_likes (post_id,user_id) VALUES (%s,%s)",(pid,user_id))
+    c.connection.commit()
     c.execute("SELECT COUNT(*) FROM post_likes WHERE post_id=%s",(pid,))
     count = c.fetchone()[0]
     c.connection.close()
@@ -490,11 +509,7 @@ async def unlike_post(pid: int, request: Request, userId: int = 0):
 @app.get("/api/posts/{pid}/comments")
 async def post_comments(pid: int):
     c = db().cursor(DictCursor)
-    # Try comments table first, fallback to post_comments
-    try:
-        c.execute("SELECT c.id,c.content,c.user_id,c.create_time,u.nickname FROM comments c LEFT JOIN users u ON c.user_id=u.id WHERE c.post_id=%s ORDER BY c.create_time",(pid,))
-    except:
-        return []
+    c.execute("SELECT c.id,c.content,c.user_id,c.create_time,u.nickname FROM comments c LEFT JOIN users u ON c.user_id=u.id WHERE c.post_id=%s ORDER BY c.create_time",(pid,))
     comments = c.fetchall()
     c.connection.close()
     return [{"id":c['id'],"content":c['content'],"user":{"nickname":c.get('nickname','')}} for c in comments]
@@ -510,14 +525,9 @@ async def add_comment(pid: int, req: Request):
     try:
         c.execute("INSERT INTO comments (post_id,user_id,content,create_time) VALUES (%s,%s,%s,NOW())",(pid,uid,content))
         c.connection.commit()
-    except Exception as e:
+    except Exception:
         c.connection.close()
-        # Fallback: use post_comments table
-        c2 = db().cursor()
-        c2.execute("INSERT INTO post_comments (post_id,user_id,content,create_time) VALUES (%s,%s,%s,NOW())",(pid,uid,content))
-        c2.connection.commit()
-        c2.connection.close()
-        return {"ok":True}
+        raise HTTPException(400, "评论发布失败")
     c.connection.close()
     return {"ok":True}
 
@@ -534,6 +544,16 @@ async def stats():
 # ===== HEALTH =====
 @app.get("/api/health")
 async def health(): return {"status":"ok"}
+
+
+@app.get("/api/health/ready")
+async def readiness():
+    c = db().cursor()
+    c.execute("SELECT 1")
+    c.fetchone()
+    c.connection.close()
+    return {"status": "ready"}
+
 
 # ===== PUBLIC STATS =====
 @app.get("/api/public/stats")

@@ -8,8 +8,17 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 Push-Location $root
 try {
+    & $python -m compileall -q backend
+    if ($LASTEXITCODE -ne 0) { throw 'Backend compile failed' }
+
     & $python -m pytest -q
     if ($LASTEXITCODE -ne 0) { throw 'Backend tests failed' }
+
+    $env:DB_USER = 'migration-test'
+    $env:DB_PASSWORD = 'migration-test'
+    $env:DB_NAME = 'migration-test'
+    & $python -m alembic upgrade head --sql | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Alembic offline validation failed' }
 
     Push-Location (Join-Path $root 'frontend')
     try {
