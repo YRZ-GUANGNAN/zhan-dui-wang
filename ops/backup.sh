@@ -22,6 +22,7 @@ mysqldump \
   --routines \
   --triggers \
   --events \
+  --no-tablespaces \
   "$database" | gzip -9 > "$temporary"
 
 gzip -t "$temporary"
