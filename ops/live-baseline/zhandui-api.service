@@ -1,0 +1,13 @@
+[Unit]
+Description=湛对网统一API
+After=network.target mysql.service
+
+[Service]
+User=root
+WorkingDirectory=/opt/zhandui
+ExecStart=/opt/zhandui/venv/bin/python3 /opt/zhandui/api_service.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

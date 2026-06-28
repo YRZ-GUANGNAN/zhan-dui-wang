@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>湛对网</title>
+    <meta name="description" content="湛对网 - 交换故事，遇见同频的人。校园以物换物与轻社交社区。" />
+    <meta property="og:title" content="湛对网" />
+    <meta property="og:description" content="交换故事，遇见同频的人" />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#3b82f6" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script>
+      // 访问链接拼接时间戳，确保每次都是最新版本
+      (function() {
+        if (location.search.indexOf('_t=') === -1) {
+          var sep = location.search ? '&' : '?';
+          location.replace(location.href + sep + '_t=' + Date.now());
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
