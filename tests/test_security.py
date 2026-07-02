@@ -44,6 +44,22 @@ def test_health_is_public():
     assert response.json() == {"status": "ok"}
 
 
+def test_request_id_header_is_returned():
+    response = client.get(
+        "/api/health",
+        headers={"X-Request-ID": "request-id-test-123"},
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "request-id-test-123"
+
+
+def test_invalid_request_id_is_replaced():
+    response = client.get("/api/health", headers={"X-Request-ID": "bad id"})
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] != "bad id"
+    assert len(response.headers["X-Request-ID"]) == 24
+
+
 def test_readiness_checks_database(monkeypatch):
     class FakeConnection:
         def __init__(self):
@@ -120,6 +136,87 @@ def test_admin_conversations_route_is_not_shadowed():
     ]
     assert len(admin_routes) == 1
     assert admin_routes[0].endpoint.__name__ == "admin_conversations"
+
+
+def test_admin_login_success_is_audited(monkeypatch):
+    events = []
+
+    def fake_log_audit(_request, event, level=api_service.logging.INFO, **fields):
+        events.append((event, level, fields))
+
+    monkeypatch.setattr(api_service, "log_audit", fake_log_audit)
+    response = client.post(
+        "/api/admin/login",
+        json={"username": "admin", "password": "test-admin-password"},
+    )
+
+    assert response.status_code == 200
+    assert events == [
+        ("admin_login_success", api_service.logging.INFO, {"username": "admin"})
+    ]
+
+
+def test_admin_login_failure_is_audited(monkeypatch):
+    events = []
+
+    def fake_log_audit(_request, event, level=api_service.logging.INFO, **fields):
+        events.append((event, level, fields))
+
+    monkeypatch.setattr(api_service, "log_audit", fake_log_audit)
+    response = client.post(
+        "/api/admin/login",
+        json={"username": "admin", "password": "wrong-password"},
+    )
+
+    assert response.status_code == 401
+    assert events == [
+        ("admin_login_failed", api_service.logging.WARNING, {"username": "admin"})
+    ]
+
+
+def test_admin_delete_user_is_audited(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.connection = self
+            self.sql = None
+            self.args = None
+            self.committed = False
+            self.closed = False
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args):
+            self.sql = sql
+            self.args = args
+
+        def commit(self):
+            self.committed = True
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeCursor()
+
+    def fake_log_audit(_request, event, level=api_service.logging.INFO, **fields):
+        events.append((event, level, fields))
+
+    monkeypatch.setattr(api_service, "check_admin", lambda _request: True)
+    monkeypatch.setattr(api_service, "db", lambda: fake)
+    monkeypatch.setattr(api_service, "log_audit", fake_log_audit)
+
+    response = client.delete("/api/admin/users/42")
+
+    assert response.status_code == 200
+    assert fake.sql == "DELETE FROM users WHERE id=%s"
+    assert fake.args == (42,)
+    assert fake.committed is True
+    assert fake.closed is True
+    assert events == [
+        ("admin_delete_user", api_service.logging.INFO, {"target_user_id": 42})
+    ]
 
 
 def test_image_type_comes_from_content(tmp_path, monkeypatch):

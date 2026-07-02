@@ -7,6 +7,7 @@ from pymysql.err import IntegrityError
 from pymysql.cursors import DictCursor
 import bcrypt, jwt as pyjwt, datetime as dt, secrets, json, uvicorn, random
 import asyncio, os
+import logging, sys
 
 try:
     from .database import DatabasePool
@@ -17,6 +18,84 @@ app = FastAPI(title="湛对网API")
 
 # Rate limiting
 import collections, time as time_mod
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def utc_timestamp() -> str:
+    return utc_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": utc_timestamp(),
+            "level": record.levelname,
+            "logger": record.name,
+            "event": record.getMessage(),
+        }
+        payload.update(getattr(record, "fields", {}) or {})
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def configure_logging():
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonLogFormatter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
+    logging.getLogger("uvicorn.access").disabled = True
+
+
+configure_logging()
+logger = logging.getLogger("zhandui.api")
+audit_logger = logging.getLogger("zhandui.audit")
+LOG_HEALTHCHECKS = os.environ.get("LOG_HEALTHCHECKS", "false").lower() == "true"
+
+
+def log_event(target: logging.Logger, level: int, event: str, **fields):
+    clean_fields = {key: value for key, value in fields.items() if value is not None}
+    target.log(level, event, extra={"fields": clean_fields})
+
+
+def normalized_request_id(value: str | None) -> str:
+    value = (value or "").strip()
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if 8 <= len(value) <= 128 and all(ch in allowed for ch in value):
+        return value
+    return secrets.token_hex(12)
+
+
+def request_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else ""
+
+
+def should_log_request(path: str, status_code: int) -> bool:
+    if status_code >= 400:
+        return True
+    if LOG_HEALTHCHECKS:
+        return True
+    return path not in {"/api/health", "/api/health/ready"}
+
+
+def log_audit(request: Request, event: str, level: int = logging.INFO, **fields):
+    log_event(
+        audit_logger,
+        level,
+        event,
+        request_id=getattr(request.state, "request_id", None),
+        client_ip=request_client_ip(request),
+        **fields,
+    )
+
+
 _rate_limits = collections.defaultdict(list)
 def rate_limit(key: str, max_req: int = 30, window: int = 60):
     now = time_mod.time()
@@ -69,25 +148,66 @@ def decode_user_token(token: str) -> int:
 
 @app.middleware("http")
 async def authenticate_api_request(request: Request, call_next):
+    request_id = normalized_request_id(request.headers.get("x-request-id"))
+    request.state.request_id = request_id
     path = request.url.path
-    if path.startswith("/api/") and path not in PUBLIC_API_PATHS and not path.startswith("/api/admin/"):
-        authorization = request.headers.get("Authorization", "")
-        if not authorization.startswith("Bearer "):
-            return JSONResponse({"detail": "Authentication required"}, status_code=401)
-        try:
-            request.state.user_id = decode_user_token(authorization[7:])
-        except (pyjwt.PyJWTError, KeyError, TypeError, ValueError):
-            return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
-
-        for key in ("userId", "senderId"):
-            claimed = request.query_params.get(key)
-            if claimed is not None:
+    method = request.method
+    start = time_mod.perf_counter()
+    response = None
+    try:
+        if path.startswith("/api/") and path not in PUBLIC_API_PATHS and not path.startswith("/api/admin/"):
+            authorization = request.headers.get("Authorization", "")
+            if not authorization.startswith("Bearer "):
+                response = JSONResponse({"detail": "Authentication required"}, status_code=401)
+            else:
                 try:
-                    if int(claimed) != request.state.user_id:
-                        return JSONResponse({"detail": "Forbidden"}, status_code=403)
-                except ValueError:
-                    return JSONResponse({"detail": f"Invalid {key}"}, status_code=400)
-    return await call_next(request)
+                    request.state.user_id = decode_user_token(authorization[7:])
+                except (pyjwt.PyJWTError, KeyError, TypeError, ValueError):
+                    response = JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
+
+            if response is None:
+                for key in ("userId", "senderId"):
+                    claimed = request.query_params.get(key)
+                    if claimed is not None:
+                        try:
+                            if int(claimed) != request.state.user_id:
+                                response = JSONResponse({"detail": "Forbidden"}, status_code=403)
+                                break
+                        except ValueError:
+                            response = JSONResponse({"detail": f"Invalid {key}"}, status_code=400)
+                            break
+        if response is None:
+            response = await call_next(request)
+        return response
+    except Exception:
+        log_event(
+            logger,
+            logging.ERROR,
+            "request_failed",
+            request_id=request_id,
+            method=method,
+            path=path,
+            client_ip=request_client_ip(request),
+            duration_ms=round((time_mod.perf_counter() - start) * 1000, 2),
+        )
+        logger.exception("request_exception", extra={"fields": {"request_id": request_id}})
+        raise
+    finally:
+        if response is not None:
+            response.headers["X-Request-ID"] = request_id
+            status_code = response.status_code
+            if should_log_request(path, status_code):
+                log_event(
+                    logger,
+                    logging.WARNING if status_code >= 400 else logging.INFO,
+                    "request_completed",
+                    request_id=request_id,
+                    method=method,
+                    path=path,
+                    status=status_code,
+                    client_ip=request_client_ip(request),
+                    duration_ms=round((time_mod.perf_counter() - start) * 1000, 2),
+                )
 
 
 def require_self(request: Request, claimed_user_id) -> int:
@@ -395,7 +515,8 @@ async def login(req: Request):
     c.connection.close()
     if not user: raise HTTPException(401, "用户不存在")
     if not bcrypt.checkpw(p.encode(), user['password'].encode()): raise HTTPException(401, "密码错误")
-    token = pyjwt.encode({"userId":user['id'],"sub":user['username'],"iat":dt.datetime.utcnow(),"exp":dt.datetime.utcnow()+dt.timedelta(days=7)}, JWT_SECRET, algorithm="HS256")
+    now = utc_now()
+    token = pyjwt.encode({"userId":user['id'],"sub":user['username'],"iat":now,"exp":now+dt.timedelta(days=7)}, JWT_SECRET, algorithm="HS256")
     return {"token":token,"userId":user['id'],"username":user['username']}
 
 @app.post("/api/auth/register")
@@ -420,7 +541,8 @@ async def register(req: Request):
         c.connection.close()
         raise HTTPException(400, "注册失败，请检查用户名或邮箱是否已存在")
     c.connection.close()
-    token = pyjwt.encode({"userId":uid,"sub":u,"iat":dt.datetime.utcnow(),"exp":dt.datetime.utcnow()+dt.timedelta(days=7)}, JWT_SECRET, algorithm="HS256")
+    now = utc_now()
+    token = pyjwt.encode({"userId":uid,"sub":u,"iat":now,"exp":now+dt.timedelta(days=7)}, JWT_SECRET, algorithm="HS256")
     return {"token":token,"userId":uid,"username":u}
 
 # ===== USERS =====
@@ -903,16 +1025,18 @@ async def admin_login(req: Request):
     data = await req.json()
     if data.get("username") == ADMIN_USER and data.get("password") == ADMIN_PASS:
         token = secrets.token_hex(32)
-        admin_sessions[token] = dt.datetime.utcnow() + dt.timedelta(hours=24)
+        admin_sessions[token] = utc_now() + dt.timedelta(hours=24)
         resp = JSONResponse({"ok": True})
         resp.set_cookie("admin_token", token, httponly=True, secure=True, samesite="strict", max_age=86400)
+        log_audit(req, "admin_login_success", username=data.get("username"))
         return resp
+    log_audit(req, "admin_login_failed", logging.WARNING, username=data.get("username"))
     raise HTTPException(401, "账号或密码错误")
 
 def check_admin(request: Request):
     token = request.cookies.get("admin_token")
     if not token or token not in admin_sessions: raise HTTPException(401)
-    if admin_sessions[token] < dt.datetime.utcnow(): del admin_sessions[token]; raise HTTPException(401)
+    if admin_sessions[token] < utc_now(): del admin_sessions[token]; raise HTTPException(401)
     return True
 
 
@@ -989,6 +1113,7 @@ async def admin_users(request: Request, page: int = 1, keyword: str = ""):
 async def admin_delete_user(uid: int, request: Request):
     check_admin(request)
     c = db().cursor(); c.execute("DELETE FROM users WHERE id=%s",(uid,)); c.connection.commit(); c.connection.close()
+    log_audit(request, "admin_delete_user", target_user_id=uid)
     return {"ok":True}
 
 @app.get("/api/admin/posts")
@@ -1010,10 +1135,12 @@ async def admin_posts(request: Request, page: int = 1, keyword: str = ""):
 async def admin_delete_post(pid: int, request: Request):
     check_admin(request)
     c = db().cursor(); c.execute("DELETE FROM posts WHERE id=%s",(pid,)); c.connection.commit(); c.connection.close()
+    log_audit(request, "admin_delete_post", target_post_id=pid)
     return {"ok":True}
 
 @app.get("/api/admin/logout")
-async def admin_logout():
+async def admin_logout(request: Request):
+    log_audit(request, "admin_logout")
     resp = JSONResponse({"ok":True}); resp.delete_cookie("admin_token"); return resp
 
 @app.get("/admin", response_class=HTMLResponse)
