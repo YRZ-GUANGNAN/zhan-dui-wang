@@ -267,7 +267,6 @@ export default {
             const ok = await this.sendFriendRequest(targetId)
             if (ok) {
               try {
-                const { default: api } = await import('../api/index.js')
                 await api.messages.send(localStorage.getItem('userId'), targetId, '你好，很高兴认识你！')
               } catch (e) {}
               this.nextCard()

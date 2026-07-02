@@ -78,6 +78,8 @@
 </template>
 
 <script>
+import api from '../api/index.js'
+
 export default {
   name: 'PhoneLogin',
   data() {
@@ -152,7 +154,6 @@ export default {
         }
 
         // 2. 尝试用手机号登录
-        const { default: api } = await import('../api/index.js')
         try {
           const loginRes = await api.auth.login({
             username: this.phone,

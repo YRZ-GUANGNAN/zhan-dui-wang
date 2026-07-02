@@ -24,6 +24,7 @@
       <router-link to="/profile" class="nav-item" :class="{ active: $route.path === '/profile' }">
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span>我的</span>
+        <span v-if="requestCount > 0" class="badge-dot">{{ requestCount > 99 ? '99+' : requestCount }}</span>
       </router-link>
       <div class="nav-glow" :style="navGlowStyle"></div>
     </nav>
@@ -31,12 +32,12 @@
 </template>
 
 <script>
+import api from './api/index.js'
 import { connect, onNotification, offNotification } from './api/websocket.js'
 export default {
   name: 'App',
-  data() { return { requestCount: 0, unreadMessages: 0, navIndex: 0 } },
+  data() { return { requestCount: 0, unreadMessages: 0, notificationHandler: null } },
   computed: {
-    isLoggedIn() { return !!localStorage.getItem('token') },
     navGlowStyle() {
       const paths = ['/', '/square', '/planet', '/chats', '/profile']
       const idx = paths.findIndex(p => {
@@ -51,16 +52,23 @@ export default {
   },
   watch: {
     '$route'(to) {
-      if (this.isLoggedIn) { this.fetchRequestCount(); connect() }
+      if (this.hasToken()) {
+        this.fetchRequestCount()
+        this.ensureNotifications()
+        connect()
+      } else {
+        this.requestCount = 0
+        this.unreadMessages = 0
+      }
       // Clear unread when entering chat
       if (to.path.startsWith('/chat/')) this.unreadMessages = 0
     }
   },
   mounted() {
-    if (this.isLoggedIn) {
+    if (this.hasToken()) {
       this.fetchRequestCount()
+      this.ensureNotifications()
       connect()
-      this.setupNotification()
     }
     if (window.__wxjs_environment === 'miniprogram' || navigator.userAgent.indexOf('miniProgram') > -1) {
       if (location.search.indexOf('_t=') === -1) {
@@ -69,20 +77,26 @@ export default {
       }
     }
   },
-  beforeUnmount() { offNotification() },
+  beforeUnmount() {
+    if (this.notificationHandler) offNotification(this.notificationHandler)
+  },
   methods: {
-    setupNotification() {
-      onNotification((msg) => {
+    hasToken() {
+      return !!localStorage.getItem('token')
+    },
+    ensureNotifications() {
+      if (this.notificationHandler) return
+      this.notificationHandler = (msg) => {
         this.unreadMessages++
         // Skip if already on this chat
         if (this.$route.path === '/chat/' + msg.sender.id) {
           this.unreadMessages = Math.max(0, this.unreadMessages - 1)
         }
-      })
+      }
+      onNotification(this.notificationHandler)
     },
     async fetchRequestCount() {
       try {
-        const { default: api } = await import('./api/index.js')
         const res = await api.friends.requests(localStorage.getItem('userId'))
         this.requestCount = res.data.length
       } catch(e) { /* ignore */ }
@@ -276,8 +290,8 @@ select.input option { background: white; color: var(--text); }
 .avatar-sm { width: 40px; height: 40px; font-size: 16px; }
 
 /* Bottom Navigation */
-.bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
-  position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+.bottom-nav {
+  position: fixed; bottom: calc(12px + var(--safe-bottom)); left: 50%; transform: translateX(-50%);
   width: calc(100% - 32px); max-width: 440px; height: var(--nav-height);
   background: rgba(255,255,255,0.9);
   backdrop-filter: blur(25px); -webkit-backdrop-filter: blur(25px);
@@ -286,7 +300,7 @@ select.input option { background: white; color: var(--text); }
   display: flex;
   box-shadow: 0 4px 20px rgba(0,0,0,0.08);
   padding-bottom: 0; z-index: 100;
-  position: relative; overflow: hidden;
+  overflow: hidden;
 }
 
 .nav-glow {
