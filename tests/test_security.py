@@ -60,6 +60,20 @@ def test_invalid_request_id_is_replaced():
     assert len(response.headers["X-Request-ID"]) == 24
 
 
+def test_malformed_json_returns_bad_request_with_request_id():
+    response = client.post(
+        "/api/admin/login",
+        content="{bad-json",
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": "bad-json-test-123",
+        },
+    )
+    assert response.status_code == 400
+    assert response.headers["X-Request-ID"] == "bad-json-test-123"
+    assert response.json() == {"detail": "Invalid JSON"}
+
+
 def test_readiness_checks_database(monkeypatch):
     class FakeConnection:
         def __init__(self):

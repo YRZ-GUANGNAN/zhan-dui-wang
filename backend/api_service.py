@@ -220,6 +220,16 @@ def require_self(request: Request, claimed_user_id) -> int:
     return claimed
 
 
+async def json_body(request: Request) -> dict:
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(400, "Invalid JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Invalid JSON")
+    return data
+
+
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
 UPLOAD_ROOT = os.environ.get("UPLOAD_ROOT", "/opt/zhandui/uploads")
 
@@ -505,7 +515,7 @@ def ok(data): return data
 @app.post("/api/auth/login")
 async def login(req: Request):
     rate_limit(f"login_{req.client.host}", 10, 60)
-    data = await req.json()
+    data = await json_body(req)
     u = data.get("username","").strip()
     p = data.get("password","").strip()
     if not u or not p: raise HTTPException(400, "用户名密码不能为空")
@@ -522,7 +532,7 @@ async def login(req: Request):
 @app.post("/api/auth/register")
 async def register(req: Request):
     rate_limit(f"register_{req.client.host}", 5, 60)  # 5 reg/minute
-    data = await req.json()
+    data = await json_body(req)
     u = data.get("username","").strip()
     p = data.get("password","").strip()
     e = data.get("email","").strip()
@@ -592,7 +602,7 @@ async def get_user(uid: int, request: Request):
 @app.put("/api/users/{uid}/profile")
 async def update_profile(uid: int, req: Request):
     require_self(req, uid)
-    data = await req.json()
+    data = await json_body(req)
     fields = {k:v for k,v in data.items() if v is not None and k in ['nickname','age','gender','bio','location','email']}
     if not fields: raise HTTPException(400, "无更新字段")
     c = db().cursor()
@@ -728,7 +738,7 @@ async def conversation(request: Request, userId: int = 0, otherUserId: int = 0):
 
 @app.post("/api/messages")
 async def send_message(req: Request):
-    data = await req.json()
+    data = await json_body(req)
     sid = req.state.user_id
     try:
         rid = int(req.query_params.get("receiverId", data.get("receiverId",0)))
@@ -918,7 +928,7 @@ async def post_comments(pid: int):
 
 @app.post("/api/posts/{pid}/comment")
 async def add_comment(pid: int, req: Request):
-    data = await req.json()
+    data = await json_body(req)
     uid = require_self(req, data.get("userId",0))
     content = data.get("content","").strip()
     if not content or len(content) > 1000:
@@ -1022,7 +1032,7 @@ admin_sessions = {}
 @app.post("/api/admin/login")
 async def admin_login(req: Request):
     rate_limit(f"admin_login_{req.client.host}", 5, 60)
-    data = await req.json()
+    data = await json_body(req)
     if data.get("username") == ADMIN_USER and data.get("password") == ADMIN_PASS:
         token = secrets.token_hex(32)
         admin_sessions[token] = utc_now() + dt.timedelta(hours=24)
